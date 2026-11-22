@@ -139,6 +139,10 @@ class Simulator:
         self.specs: dict[str, SpecDef] = {spec.name: spec for spec in layout.specs}
         self.slices: dict[str, SimSlice] = {}
         self.fault: Fault | None = None
+        # Per-operation delay of the simulated driver, in milliseconds.  A
+        # non-zero value turns every driver step into a visible "slow card"
+        # step so another browser tab can watch partial progress.
+        self.step_delay_ms = 0
         self._external_seq = 0
         for slc in layout.slices:
             accepting = slc.kind == "idle" if slc.accepting is None else slc.accepting
@@ -364,6 +368,12 @@ class Simulator:
     def clear_fault(self) -> None:
         self.fault = None
 
+    def set_step_delay(self, step_delay_ms: int) -> int:
+        if step_delay_ms < 0:
+            raise SimError("单步延迟不能为负数")
+        self.step_delay_ms = int(step_delay_ms)
+        return self.step_delay_ms
+
     def trigger_fault(self) -> Fault | None:
         """Consume one fault firing; clears the fault once ``count`` is used."""
         fault = self.fault
@@ -391,6 +401,7 @@ class Simulator:
             "slices": [slc.to_dict() for slc in self.sorted_slices()],
             "slots": self.slots_view(),
             "fault": self.fault.to_dict() if self.fault else None,
+            "driver": {"step_delay_ms": self.step_delay_ms},
         }
 
     def clone_dict(self) -> dict:

@@ -7,6 +7,7 @@ observed evidence, making it obvious which behaviours are verified.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 from .batch import BatchError, BatchService
@@ -73,6 +74,7 @@ def run_selftest() -> dict:
         _scenario_order_arrived_before_confirm(),
         _scenario_driver_error_after_apply(),
         _scenario_retry_only_unfinished(),
+        _scenario_slow_driver_live_and_busy(),
         _scenario_no_solution_keeps_card_untouched(),
         _scenario_planner_minimises_removals(),
     ]
@@ -244,6 +246,96 @@ def _scenario_retry_only_unfinished() -> Scenario:
             len(creates) == len(set(creates)),
             f"applied_ops={ops}",
         )
+    except Exception as exc:  # pragma: no cover
+        sc.error = f"{type(exc).__name__}: {exc}"
+    return sc
+
+
+def _scenario_slow_driver_live_and_busy() -> Scenario:
+    sc = Scenario(
+        key="slow_driver",
+        title="慢驱动：刷新可见部分进度，冲突操作提示忙",
+        intent=(
+            "设置单步延迟后确认执行；驱动执行期间读取实际布局应能看到已生效的步骤与"
+            "待完成步骤，同时重复执行 / 放弃 / 外部拆建 / 导入 / 重试都被拒绝。"
+        ),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def gated_sleep(_seconds: float) -> None:
+        entered.set()
+        release.wait(5)
+
+    sim = Simulator(SELFTEST_LAYOUT)
+    sim.set_step_delay(100)
+    svc = BatchService(sim, driver_sleep=gated_sleep)
+    out: dict = {}
+
+    try:
+        batch = svc.plan([("1g.10gb", "a"), ("1g.10gb", "b")])
+        expected_ops = len(batch.plan.removals) + 2
+        sc.check("方案共 3 项驱动操作", expected_ops == 3, f"total={expected_ops}")
+
+        def drive() -> None:
+            try:
+                out["batch"] = svc.confirm()
+            except Exception as exc:  # pragma: no cover - surfaced to the UI
+                out["error"] = exc
+
+        thread = threading.Thread(target=drive, daemon=True)
+        thread.start()
+        if not entered.wait(5):
+            sc.check("驱动已开始执行", False, "驱动未进入第一步")
+            return sc
+        sc.check("驱动执行中 busy 标记为真", svc.busy is True)
+
+        view = svc.batch.to_dict(sim)
+        sc.check("刷新可读到执行中的进度", view["driver"]["running"] is True)
+        sc.check(
+            "执行中可读到待完成步骤",
+            len(view["driver"]["ops"]) == expected_ops and view["driver"]["done"] == 0,
+            f"done={view['driver']['done']} ops={view['driver']['ops']}",
+        )
+        sc.check(
+            "执行中实际布局尚与方案不一致",
+            view["actual"]["layout_matches_plan"] is False,
+        )
+
+        busy_rejections = {
+            "重复执行": lambda: svc.apply_held(),
+            "放弃": lambda: svc.abandon(),
+            "重试": lambda: svc.retry(),
+            "新规划": lambda: svc.plan([("2g.20gb", "x"), ("2g.20gb", "y")]),
+        }
+        for label, fn in busy_rejections.items():
+            try:
+                fn()
+                ok, detail = False, "未被拒绝"
+            except BatchError as exc:
+                ok = "驱动正在执行" in str(exc)
+                detail = str(exc)
+            sc.check(f"执行期间{label}被拒绝（忙）", ok, detail)
+    except Exception as exc:  # pragma: no cover - reported to the UI
+        sc.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        release.set()
+        if "thread" in locals():
+            thread.join(5)
+
+    try:
+        result = out.get("batch")
+        sc.check("释放延迟后批次完成", bool(result) and result.state == "delivered",
+                 getattr(result, "state", str(out.get("error"))))
+        if result is not None:
+            actual = result.describe_actual(sim)
+            sc.check("最终实际布局与方案一致", actual["layout_matches_plan"] is True)
+            sc.check("执行结束后 busy 标记复位", svc.busy is False)
+            sc.check(
+                "执行结束后进度显示全部完成",
+                result.progress["done"] == result.progress["total"],
+                f"{result.progress['done']}/{result.progress['total']}",
+            )
     except Exception as exc:  # pragma: no cover
         sc.error = f"{type(exc).__name__}: {exc}"
     return sc

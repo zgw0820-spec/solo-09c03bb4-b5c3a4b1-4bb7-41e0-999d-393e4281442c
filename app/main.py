@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from .batch import BatchError, BatchService
 from .defaults import DEFAULT_LAYOUT, default_layout_json
 from .models import (
+    DriverDelayRequest,
     ExternalIdleSliceRequest,
     ExternalRemoveRequest,
     FaultRequest,
@@ -27,21 +28,27 @@ BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI(title="MIG 切片调整值班台", version="1.0.0")
 
-sim = Simulator(DEFAULT_LAYOUT)
-service = BatchService(sim)
-
 # Sync endpoints run in a thread pool, so every state-touching request is
 # serialised.  The console is a single-operator tool; this keeps the invariant
 # checks in the batch service race-free without a full database transaction.
+# The batch service shares this lock but sleeps between driver steps *outside*
+# it, so reads stay live while a slow card is being changed.
 LOCK = threading.RLock()
+
+sim = Simulator(DEFAULT_LAYOUT)
+service = BatchService(sim, guard=LOCK)
 
 
 def state_payload() -> dict:
-    return {
-        "layout": sim.to_dict(),
-        "batch": service.batch.to_dict(sim) if service.batch else None,
-        "default_layout": default_layout_json(),
-    }
+    # Snapshot under the lock so a read never catches the driver mid-mutation
+    # (the lock is only held for one committed step at a time).
+    with LOCK:
+        return {
+            "layout": sim.to_dict(),
+            "batch": service.batch.to_dict(sim) if service.batch else None,
+            "busy": service.busy,
+            "default_layout": default_layout_json(),
+        }
 
 
 def handle(fn, *args, **kwargs):
@@ -51,6 +58,15 @@ def handle(fn, *args, **kwargs):
         raise HTTPException(status_code=409, detail=str(exc))
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=_validation_detail(exc))
+
+
+def ensure_driver_idle() -> None:
+    """Refuse direct simulator writes while the driver is mid-run."""
+    if service.busy:
+        raise HTTPException(
+            status_code=409,
+            detail=service.busy_message(),
+        )
 
 
 def _validation_detail(exc: ValidationError) -> str:
@@ -68,22 +84,29 @@ def index() -> HTMLResponse:
 
 @app.get("/api/state")
 def get_state() -> dict:
-    with LOCK:
-        return state_payload()
+    return state_payload()
 
 
 @app.post("/api/layout/import")
 def import_layout(layout: LayoutImport) -> dict:
     global sim, service
     with LOCK:
+        ensure_driver_idle()
         if service.batch and service.batch.state in ("applying", "failed"):
             raise HTTPException(
                 status_code=409,
                 detail="当前批次尚未结束，先重试或放弃后才能重新导入布局",
             )
         sim = Simulator(layout)
-        service = BatchService(sim)
+        sim.set_step_delay(_previous_delay())
+        service = BatchService(sim, guard=LOCK)
         return state_payload()
+
+
+def _previous_delay() -> int:
+    # The simulated card's knobs are simulator-wide, not per-layout: keep the
+    # operator's chosen step delay across a reset/import.
+    return getattr(service.sim, "step_delay_ms", 0)
 
 
 @app.post("/api/layout/reset")
@@ -96,55 +119,56 @@ def reset_layout(force: bool = True) -> dict:
     """
     global sim, service
     with LOCK:
+        ensure_driver_idle()
         if not force:
             return import_layout(DEFAULT_LAYOUT)
+        delay = _previous_delay()
         sim = Simulator(DEFAULT_LAYOUT)
-        service = BatchService(sim)
+        sim.set_step_delay(delay)
+        service = BatchService(sim, guard=LOCK)
         return state_payload()
 
 
 @app.post("/api/plan")
 def plan(payload: PlanRequest) -> dict:
-    with LOCK:
-        requests = [
-            (item.spec.strip(), (item.name or item.spec).strip())
-            for item in payload.new_slices
-        ]
-        handle(service.plan, requests)
-        return state_payload()
+    requests = [
+        (item.spec.strip(), (item.name or item.spec).strip())
+        for item in payload.new_slices
+    ]
+    # Called outside the console lock: the service takes it for its own short
+    # critical sections.  A slow driver must never block /api/state.
+    handle(service.plan, requests)
+    return state_payload()
 
 
 @app.post("/api/batch/confirm")
 def confirm(hold: bool = False) -> dict:
-    with LOCK:
-        handle(service.confirm, hold=hold)
-        return state_payload()
+    handle(service.confirm, hold=hold)
+    return state_payload()
 
 
 @app.post("/api/batch/apply")
 def apply_held() -> dict:
-    with LOCK:
-        handle(service.apply_held)
-        return state_payload()
+    handle(service.apply_held)
+    return state_payload()
 
 
 @app.post("/api/batch/retry")
 def retry() -> dict:
-    with LOCK:
-        handle(service.retry)
-        return state_payload()
+    handle(service.retry)
+    return state_payload()
 
 
 @app.post("/api/batch/abandon")
 def abandon(rollback_drafts: bool = True) -> dict:
-    with LOCK:
-        handle(service.abandon, rollback_drafts=rollback_drafts)
-        return state_payload()
+    handle(service.abandon, rollback_drafts=rollback_drafts)
+    return state_payload()
 
 
 @app.post("/api/order")
 def order(payload: OrderRequest) -> dict:
     with LOCK:
+        ensure_driver_idle()
         handle(sim.place_order, slice_id=payload.slice_id, force=payload.force)
         return state_payload()
 
@@ -152,6 +176,7 @@ def order(payload: OrderRequest) -> dict:
 @app.post("/api/fault")
 def fault(payload: FaultRequest) -> dict:
     with LOCK:
+        ensure_driver_idle()
         handle(
             sim.set_fault,
             mode=payload.mode,
@@ -165,13 +190,24 @@ def fault(payload: FaultRequest) -> dict:
 @app.post("/api/fault/clear")
 def clear_fault() -> dict:
     with LOCK:
+        ensure_driver_idle()
         sim.clear_fault()
+        return state_payload()
+
+
+@app.post("/api/driver/delay")
+def set_driver_delay(payload: DriverDelayRequest) -> dict:
+    """Set the simulated driver's per-operation delay (slow-card drill)."""
+    with LOCK:
+        ensure_driver_idle()
+        handle(sim.set_step_delay, payload.step_delay_ms)
         return state_payload()
 
 
 @app.post("/api/external/add-idle")
 def external_add(payload: ExternalIdleSliceRequest) -> dict:
     with LOCK:
+        ensure_driver_idle()
         handle(sim.external_add_idle, payload.spec, payload.interval, payload.id)
         return state_payload()
 
@@ -179,6 +215,7 @@ def external_add(payload: ExternalIdleSliceRequest) -> dict:
 @app.post("/api/external/remove")
 def external_remove(payload: ExternalRemoveRequest) -> dict:
     with LOCK:
+        ensure_driver_idle()
         handle(sim.external_remove, payload.slice_id)
         return state_payload()
 

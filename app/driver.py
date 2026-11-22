@@ -9,7 +9,10 @@ driver that errors after the change already took effect.
 
 from __future__ import annotations
 
+import time
+from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import Callable
 
 from .models import SlotInterval
 from .simulator import SimError, Simulator
@@ -36,45 +39,68 @@ class DriverOp:
 
 
 class SimDriver:
-    def __init__(self, sim: Simulator):
+    def __init__(self, sim: Simulator, sleep: Callable[[float], None] = time.sleep):
         self.sim = sim
+        self._sleep = sleep
 
-    def apply(self, ops: list[DriverOp], batch_id: str | None = None) -> int:
+    def apply(
+        self,
+        ops: list[DriverOp],
+        batch_id: str | None = None,
+        on_step: Callable[[int, DriverOp], None] | None = None,
+        guard: Callable[[], object] | None = None,
+    ) -> int:
         """Apply ops in order.  Returns number applied.
+
+        ``guard`` returns a context manager (the console's state lock).  Each
+        individual mutation is committed inside the guard, while the optional
+        per-operation delay is slept *outside* it, so another page can read the
+        live layout and watch partial progress mid-run.
 
         Raises DriverError when a configured one-shot fault fires.  If the
         fault mode is ``after_apply`` the operation has already changed the
         card before the error is raised, exactly like a flaky driver.
         """
-        fault = self.sim.fault
+        guard = guard or nullcontext
         applied = 0
         for op in ops:
-            if fault is not None and applied >= fault.skip:
-                if fault.mode == "before_apply":
-                    fired = self.sim.trigger_fault()
-                    if fired is not None:
-                        raise DriverError(fired.message, applied)
-            try:
-                if op.kind == "create":
-                    assert op.spec is not None and op.interval is not None
-                    self.sim.add_slice(
-                        slice_id=op.slice_id,
-                        spec=op.spec,
-                        interval=op.interval,
-                        status="created",
-                        accepting=False,
-                        batch_id=batch_id,
-                        draft=True,
-                    )
-                elif op.kind == "remove":
-                    self.sim.remove_slice(op.slice_id, allow_running=False)
-                else:  # pragma: no cover - guarded by the planner
-                    raise DriverError(f"未知驱动操作：{op.kind}", applied)
-            except SimError as exc:
-                raise DriverError(str(exc), applied) from exc
-            applied += 1
-            if fault is not None and applied > fault.skip:
-                fired = self.sim.trigger_fault()
-                if fired is not None:
-                    raise DriverError(fired.message, applied)
+            delay = self.sim.step_delay_ms
+            if delay > 0:
+                # Slow card: the step takes time, and so does the failure.
+                self._sleep(delay / 1000.0)
+            with guard():
+                fault = self.sim.fault
+                if fault is not None and applied >= fault.skip:
+                    if fault.mode == "before_apply":
+                        fired = self.sim.trigger_fault()
+                        if fired is not None:
+                            raise DriverError(fired.message, applied)
+                try:
+                    if op.kind == "create":
+                        assert op.spec is not None and op.interval is not None
+                        self.sim.add_slice(
+                            slice_id=op.slice_id,
+                            spec=op.spec,
+                            interval=op.interval,
+                            status="created",
+                            accepting=False,
+                            batch_id=batch_id,
+                            draft=True,
+                        )
+                    elif op.kind == "remove":
+                        self.sim.remove_slice(op.slice_id, allow_running=False)
+                    else:  # pragma: no cover - guarded by the planner
+                        raise DriverError(f"未知驱动操作：{op.kind}", applied)
+                except SimError as exc:
+                    raise DriverError(str(exc), applied) from exc
+                applied += 1
+                if on_step is not None:
+                    on_step(applied, op)
+                fault = self.sim.fault
+                if fault is not None and applied > fault.skip:
+                    if fault.mode == "after_apply":
+                        fired = self.sim.trigger_fault()
+                        if fired is not None:
+                            raise DriverError(fired.message, applied)
         return applied
+

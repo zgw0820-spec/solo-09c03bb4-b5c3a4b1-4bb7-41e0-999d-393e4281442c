@@ -24,6 +24,9 @@
 | 确认时复核布局与接单状态，冲突则退回重算且**不动卡** | `BatchService._confirmation_conflict` |
 | 调整期间仅待拆切片暂停接单，其余空闲切片照常接单 | `confirm()` 只对 `plan.removals` 置 `paused` |
 | 驱动可能在改动生效后报错 | `SimDriver.apply` 的 `after_apply` 故障模式（可配置跳过 N 项、连续失败次数） |
+| 单步延迟演练慢卡 | `Simulator.step_delay_ms`；`POST /api/driver/delay`，驱动逐项生效、步间不持锁 |
+| 驱动执行中刷新可见部分进度 | `Batch.progress`（`driver.running/done/total/ops/step_delay_ms`）；`/api/state` 实时返回 |
+| 驱动执行中一切改动操作直接提示忙 | `BatchService._busy` + `ensure_driver_idle()`，重复执行/放弃/外部拆建/导入/重置/重试均 409 |
 | 网页显示实际布局，已建切片留给本批 | `Batch.describe_actual` → `batch.actual` |
 | 重试只补未完成的改动，配齐后才交付 | `_remaining_ops` 以实际卡状态计算差集；`_verify_and_deliver` 核对后才把切片转为可接单 |
 
@@ -42,9 +45,27 @@ planned ──确认（无冲突）──▶ applying ──驱动成功 + 核�
 * `applying`：待拆切片已暂停接单；本批新建切片为 `draft`（状态「本批已建」），
   既不能接单、也不会被下一批当成可拆对象。可通过「确认并暂停（暂缓驱动）」
   停留在该状态测试接单行为，再点「继续调用驱动」。
+  驱动一旦开始，`/api/state` 的 `busy` 为 `true`，批次 `driver` 字段逐项更新；
+  此期间任何改动操作都会收到 409「驱动正在执行」。
 * `failed`：驱动报错。网页展示**实际布局**与方案差异、哪些切片已建成、哪些待拆仍存在。
+  若驱动改了卡再报错，`driver.done > 0` 会如实反映已生效的项，`actual` 显示剩余差异。
 * `delivered`：两块新切片均已按方案在位，转为普通空闲切片并开始接单。
 * `abandoned`：放弃批次，可回收本批已建切片并解除暂停。
+
+### 慢卡演练（单步延迟）
+
+在「模拟器控制 → 慢驱动演练」里设置单步延迟（毫秒，0–10000），或在任意页面点击
+确认执行后由另一个页面刷新：
+
+* 延迟发生在**每一项驱动操作之前**，且**不占用全局状态锁**，所以另一个页面刷新
+  `/api/state` 会立刻看到已生效的拆除/创建、已完成项数、以及尚未完成的步骤清单；
+* 驱动执行期间，重复确认/继续驱动、重试、放弃、外部派单、外部新增/移除切片、
+  布局导入、恢复示例布局、修改延迟或故障注入都会直接返回 409 并提示忙；
+* 延迟与故障注入可叠加：`after_apply` + 延迟会先让某项改动生效，再报错；刷新后
+  能看到已生效的变化和失败原因，重试只补未完成的项。
+
+页面每 0.5–1.5 秒轮询 `/api/state`，因此第二个页面无需手动刷新也会跟上；忙时
+顶部显示提示条，本页会禁用会冲突的按钮。
 
 ---
 
@@ -69,6 +90,13 @@ uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
+慢驱动的页面演练需要服务在 `http://127.0.0.1:8000` 运行：
+
+```bash
+npm install jsdom          # 或在测试里指向已安装的 jsdom
+node tests/slow-driver.dom.js
+```
+
 ---
 
 ## 3. 页面与接口
@@ -83,14 +111,14 @@ pytest -q
    自由槽位、是否与方案一致；操作按钮随状态变化（确认 / 继续驱动 / 重试 / 放弃）；
    下方是批次事件日志。
 4. **模拟器控制**：外部派单（可强制忽略暂停标记，用于测试冲突路径）、外部新增/移除
-   空闲切片、驱动故障注入（after_apply / before_apply、跳过 N 项、连续失败次数）、
-   JSON 初始布局导入、网页自测。
+   空闲切片、慢驱动演练（单步延迟）、驱动故障注入（after_apply / before_apply、
+   跳过 N 项、连续失败次数）、JSON 初始布局导入、网页自测。
 
 主要接口（均为 JSON）：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 当前布局 + 批次 + 默认布局 |
+| GET | `/api/state` | 当前布局 + 批次 + `busy` + 默认布局；驱动执行中也能实时读取 |
 | POST | `/api/layout/import` | 导入槽位数、规格允许区间、现有切片 |
 | POST | `/api/layout/reset` | 恢复示例布局 |
 | POST | `/api/plan` | `{"new_slices":[{"spec","name"},{"spec","name"}]}`，必须恰好两块 |
@@ -98,10 +126,14 @@ pytest -q
 | POST | `/api/batch/apply` | 调整窗口结束后继续调用驱动 |
 | POST | `/api/batch/retry` | 失败后只补未完成的改动 |
 | POST | `/api/batch/abandon` | 放弃批次，`?rollback_drafts=false` 可保留已建切片 |
+| POST | `/api/driver/delay` | `{"step_delay_ms": 0..10000}`，设置驱动单步延迟 |
 | POST | `/api/order` | 外部派单（`slice_id` 可选、`force` 可忽略暂停） |
 | POST | `/api/external/add-idle` / `/api/external/remove` | 外部布局变更 |
 | POST | `/api/fault` / `/api/fault/clear` | 驱动故障注入 / 清除 |
 | POST | `/api/selftest` | 运行内置自测，返回逐项结果 |
+
+驱动执行中（`busy=true`），除 `GET /api/state`（以及 `/`, `/api/selftest`）外，
+上述写接口一律返回 `409`，`detail` 为「驱动正在执行（n/total 项）…」。
 
 ---
 
@@ -118,7 +150,10 @@ pytest -q
   不接单、不被下一批拆除。
 - 驱动层：after_apply / before_apply 故障、跳过 N 项、连续 N 次失败；
   报错后按实际卡状态重算剩余操作，配齐并核对通过后才交付。
-- 网页：布局色块、方案预览、实际/计划差异核对、批次事件日志、自测面板。
+- 慢驱动：可网页设置的单步延迟；驱动逐项生效、步间不持全局锁，执行中 `/api/state`
+  可读且带 `driver.running/done/total/ops`；执行期间所有改动操作返回 409 忙提示。
+- 网页：布局色块、方案预览、实际/计划差异核对、批次进度与待完成步骤、忙提示条、
+  轮询实时刷新、批次事件日志、自测面板。
 
 ### 已验证（可复现）
 
@@ -127,10 +162,27 @@ pytest -q
 | 核心规则与状态机 | `pytest tests/test_core.py`（17 项） | 全部通过 |
 | 场景级回归（不变量、放弃回收、已建切片被派单等） | `pytest tests/test_scenarios.py`（9 项） | 全部通过 |
 | HTTP 接口与端到端流程 | `pytest tests/test_api.py`（8 项） | 全部通过 |
-| 调整期间接单 / 确认冲突 / 驱动报错后续做 / 最少拆除 | 网页「运行自测」（`POST /api/selftest`，8 个场景 30 个断言） | 全部通过（8/8） |
+| 慢驱动：部分进度可见、忙冲突、改卡后报错与重试 | `pytest tests/test_slow_driver.py`（10 项） | 全部通过 |
+| 调整期间接单 / 确认冲突 / 驱动报错后续做 / 慢驱动 | 网页「运行自测」（`POST /api/selftest`，9 个场景 47 个断言） | 全部通过（9/9） |
 | 页面渲染与交互（jsdom 驱动真实 `app.js`） | `node tests/dom.test.js` | 全部通过（6 个场景） |
-| 真实浏览器交互 | `node tests/e2e.js`（Playwright + Chrome headless shell） | 全部通过（8 个场景，含“无控制台错误”） |
+| 慢驱动页面演练（设置延迟、执行中刷新、第二页面冲突、报错重试） | `node tests/slow-driver.dom.js`（jsdom + 真实服务） | 全部通过（4 个场景 50 项断言） |
 | 代码静态检查 | `ruff check app tests --select F,E9` | 无问题 |
+
+> `tests/e2e.js`（Playwright + Chromium，8 个场景）在早期版本上跑通过；本轮环境未安装
+> Playwright/浏览器，**未复跑**，因此不计入本轮结果。慢驱动的浏览器级验证由
+> `tests/slow-driver.dom.js`（jsdom + 真实 HTTP 服务）覆盖。
+
+本轮慢驱动演练的实际观察：
+
+- 网页把单步延迟设为 400 ms 后确认：执行中汇总显示「执行中：已完成 1/3、2/3 项」，
+  并列出「待完成步骤」；结束后显示「已交付」且「与方案一致：是」，延迟设置保留。
+- 第二页面在驱动执行中刷新：`busy=true`、`driver.running=true`、`done=1/3`；
+  实际布局已看到拆除生效、新切片仍缺失。
+- 同一时刻重复执行、重试、放弃、外部新增/移除、重置、导入全部返回 409，
+  提示「驱动正在执行（1/3 项）…」；被拒绝的外部新增没有落到卡上。
+- 延迟 + after_apply 故障：批次 `failed`，`driver.done=2/3`，刷新看到拆除与第一块
+  新切片已生效、第二块仍缺失，并展示「NVML: device busy」；点「重试」只补 1 项，
+  随后交付且与方案一致。
 
 在浏览器端到端测试中实际观察到：
 
@@ -152,6 +204,8 @@ pytest -q
 - **Docker Compose 实际启动**：本环境未安装 Docker，也没有可用的容器运行时，因此
   `docker compose up --build` 未实际执行；`docker-compose.yml` 仅做了 YAML 结构校验，
   `Dockerfile` 的构建与健康检查未跑过。请在具备 Docker 的机器上执行一次。
+- **真实浏览器（Playwright）**：本轮环境未安装 Playwright/Chromium，`tests/e2e.js`
+  未复跑；慢驱动的页面行为改由 jsdom + 真实服务验证。
 
 
 已覆盖的关键断言：
@@ -163,6 +217,8 @@ pytest -q
 - 驱动 after_apply 报错：批次 `failed`，实际已建切片在网页可见，未建成的仍缺失。
 - 重试：已生效的创建/拆除不重复执行（`applied_ops` 去重断言），配齐两块后 `delivered`，
   交付后新切片可接单。
+- 慢驱动：单步延迟按项生效；执行中读取实时布局可见 `done/total/ops` 与部分生效的改动；
+  执行中 5 类改动操作均 409；延迟 + after_apply 报错后重试只补缺失项。
 - 无解：返回原因、不可确认、卡布局不变。
 - 最少拆除：在可行方案中选择拆除数最小者，且两块新切片不重叠、运行中切片原地未动。
 
@@ -180,3 +236,6 @@ pytest -q
 - 前端为单页原生 JS，未做无障碍与移动端深度适配（仅基础响应式）。
 - 未实现的分支：调整窗口内若外部**强制**给待拆切片派单，驱动前会再次校验并让批次进入
   `failed`（已有单测覆盖），但网页上尚无“就地改选其它切片继续”的引导流程，需放弃后重规划。
+- **慢驱动只在进程内模拟**：延迟作用于 `SimDriver` 的每一项操作；真实 NVML 调用耗时
+  与并发读写语义仍需在真实驱动适配后复测。页面轮询间隔 0.5–1.5 秒，极短的单步延迟
+  未必每步都能被另一个页面观察到（最终状态仍一致）。

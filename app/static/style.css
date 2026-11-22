@@ -175,6 +175,35 @@ label.check input { margin: 0; }
   font-size: 12px;
 }
 
+.busy-banner {
+  position: sticky;
+  top: 74px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 20px;
+  padding: 9px 14px;
+  border: 1px solid #2e7bb0;
+  border-radius: 9px;
+  background: #102130;
+  color: #cfe9ff;
+  font-size: 12.5px;
+}
+.busy-banner[hidden] { display: none; }
+.spinner {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(143, 208, 255, .35);
+  border-top-color: #8fd0ff;
+  border-radius: 50%;
+  animation: busy-spin .9s linear infinite;
+}
+@keyframes busy-spin { to { transform: rotate(360deg); } }
+
+.events .event.k-applying-step .k { color: #8fd0ff; }
+
 /* --------------------------------------------------------------- table */
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; }

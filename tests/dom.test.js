@@ -101,7 +101,9 @@ async function main() {
   q("#selftest-btn").click();
   await new Promise((r) => setTimeout(r, 2500));
   assert(q(".selftest-summary.pass"), "自测全部通过");
-  assert(qa(".scenario").length === 8, "渲染 8 个自测场景");
+  assert(qa(".scenario").length === 9, "渲染 9 个自测场景");
+  const slowScenario = qa(".scenario").find((el) => el.textContent.includes("慢驱动"));
+  assert(slowScenario && !slowScenario.classList.contains("fail"), "慢驱动自测场景通过");
 
   console.log("场景 6：导入校验错误展示");
   // Abandon the held batch first, otherwise layout import is (rightly) blocked.

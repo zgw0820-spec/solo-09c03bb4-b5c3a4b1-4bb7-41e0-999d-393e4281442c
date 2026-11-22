@@ -21,8 +21,10 @@ delivery.
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Callable, Literal
 
 from .driver import DriverError, DriverOp, SimDriver
 from .planner import PlanResult, compute_plan
@@ -45,6 +47,19 @@ class BatchEvent:
         return {"at": self.at, "kind": self.kind, "message": self.message}
 
 
+def _empty_progress() -> dict:
+    return {
+        "running": False,
+        "total": 0,
+        "done": 0,
+        "current": None,
+        "ops": [],
+        "step_delay_ms": 0,
+        "started_at": None,
+        "finished_at": None,
+    }
+
+
 @dataclass
 class Batch:
     id: str
@@ -57,6 +72,7 @@ class Batch:
     events: list[BatchEvent] = field(default_factory=list)
     applied_ops: list[dict] = field(default_factory=list)
     baseline_signature: dict[str, tuple[str, int, int, bool]] = field(default_factory=dict)
+    progress: dict = field(default_factory=_empty_progress)
 
     def log(self, kind: str, message: str) -> None:
         self.events.append(BatchEvent(at=utc_now(), kind=kind, message=message))
@@ -72,6 +88,7 @@ class Batch:
             "error": self.error,
             "events": [e.to_dict() for e in self.events],
             "applied_ops": self.applied_ops,
+            "driver": dict(self.progress),
         }
         if sim is not None:
             data["actual"] = self.describe_actual(sim)
@@ -153,112 +170,158 @@ class Batch:
 
 
 class BatchService:
-    def __init__(self, sim: Simulator):
+    def __init__(
+        self,
+        sim: Simulator,
+        guard: threading.RLock | None = None,
+        driver_sleep: Callable[[float], None] | None = None,
+    ):
         self.sim = sim
-        self.driver = SimDriver(sim)
+        # ``guard`` serialises short critical sections.  The long-running
+        # driver sleeps *outside* it, so /api/state can be served while a slow
+        # card is being changed.
+        self.guard = guard or threading.RLock()
+        self.driver = SimDriver(sim, sleep=driver_sleep or time.sleep)
         self.batch: Batch | None = None
         self._batch_seq = 0
+        self._busy = False
+
+    @property
+    def busy(self) -> bool:
+        """True while the driver is mid-run; all mutations must refuse."""
+        return self._busy
+
+    def busy_message(self) -> str:
+        batch = self.batch
+        if batch is None:
+            return "驱动正在执行，请等待完成后再操作"
+        p = batch.progress
+        return (
+            f"驱动正在执行（{p.get('done', 0)}/{p.get('total', 0)} 项），"
+            "请等待本次调整完成后再操作"
+        )
+
+    def _ensure_idle(self) -> None:
+        if self._busy:
+            raise BatchError(self.busy_message())
 
     # ------------------------------------------------------------------ plan
     def plan(self, requests: list[tuple[str, str]]) -> Batch:
-        if self.batch is not None and self.batch.state in ("applying", "failed"):
-            raise BatchError(
-                "当前批次尚未结束（有已建切片留给本批），请先重试或放弃该批次"
-            )
-        if self.batch is not None and self.batch.state == "planned":
-            self._release_pauses(self.batch)
-            self.batch.log("replaced", "旧方案尚未确认，已被新方案替换")
+        with self.guard:
+            self._ensure_idle()
+            if self.batch is not None and self.batch.state in ("applying", "failed"):
+                raise BatchError(
+                    "当前批次尚未结束（有已建切片留给本批），请先重试或放弃该批次"
+                )
+            if self.batch is not None and self.batch.state == "planned":
+                self._release_pauses(self.batch)
+                self.batch.log("replaced", "旧方案尚未确认，已被新方案替换")
 
-        self._batch_seq += 1
-        batch_id = f"batch-{self._batch_seq:03d}"
-        # Allocate stable ids for the two new slices up-front so retries and
-        # the planner agree on identity.
-        slice_ids = [
-            f"new-{batch_id}-{i + 1}" for i in range(2)
-        ]
-        result = compute_plan(
-            slices=list(self.sim.slices.values()),
-            specs=self.sim.specs,
-            slot_count=self.sim.slot_count,
-            requests=requests,
-            slice_ids=slice_ids,
-        )
-        batch = Batch(
-            id=batch_id,
-            state="planned",
-            requests=list(requests),
-            slice_ids=slice_ids,
-            plan=result,
-            baseline_signature=self.sim.signature(),
-        )
-        if result.ok:
-            batch.log(
-                "planned",
-                "方案已生成：拆除 "
-                f"{result.removed_count} 块空闲切片，新建 2 块切片",
-            )
-        else:
-            batch.log("no_solution", result.error or "无解")
-        self.batch = batch
-        return batch
-
-    # --------------------------------------------------------------- confirm
-    def confirm(self, hold: bool = False) -> Batch:
-        batch = self._require_batch()
-        if batch.state != "planned":
-            raise BatchError(f"当前批次状态为 {batch.state}，不能确认")
-        if not batch.plan.ok:
-            raise BatchError("当前方案无解，不能确认；请调整规格后重新规划")
-
-        conflict = self._confirmation_conflict(batch)
-        if conflict:
-            # Nothing has been touched yet.  Drop back to planning with a
-            # freshly computed plan against the live card.
-            batch.log("conflict", conflict)
-            refreshed = compute_plan(
+            self._batch_seq += 1
+            batch_id = f"batch-{self._batch_seq:03d}"
+            # Allocate stable ids for the two new slices up-front so retries and
+            # the planner agree on identity.
+            slice_ids = [
+                f"new-{batch_id}-{i + 1}" for i in range(2)
+            ]
+            result = compute_plan(
                 slices=list(self.sim.slices.values()),
                 specs=self.sim.specs,
                 slot_count=self.sim.slot_count,
-                requests=batch.requests,
-                slice_ids=batch.slice_ids,
+                requests=requests,
+                slice_ids=slice_ids,
             )
-            batch.plan = refreshed
-            batch.baseline_signature = self.sim.signature()
-            batch.state = "planned"
-            batch.error = conflict
-            batch.log(
-                "replanned",
-                refreshed.error
-                or f"已按当前布局重算：拟拆除 {refreshed.removed_count} 块空闲切片",
+            batch = Batch(
+                id=batch_id,
+                state="planned",
+                requests=list(requests),
+                slice_ids=slice_ids,
+                plan=result,
+                baseline_signature=self.sim.signature(),
             )
+            if result.ok:
+                batch.log(
+                    "planned",
+                    "方案已生成：拆除 "
+                    f"{result.removed_count} 块空闲切片，新建 2 块切片",
+                )
+            else:
+                batch.log("no_solution", result.error or "无解")
+            self.batch = batch
             return batch
 
-        batch.error = None
-        # Pause every slice this batch intends to remove, for the whole
-        # adjustment window.  Other idle slices keep accepting.
-        for removal in batch.plan.removals:
-            slc = self.sim.get(removal.slice_id)
-            if slc is not None:
-                self.sim.set_paused(slc.id, True)
-        batch.state = "applying"
-        batch.log(
-            "confirmed",
-            "确认执行：待拆切片 "
-            + ("、".join(r.slice_id for r in batch.plan.removals) or "无")
-            + " 已暂停接单",
-        )
-        if hold:
-            batch.log("paused", "已进入调整窗口（暂不调用驱动），可测试接单行为")
-            return batch
+    # --------------------------------------------------------------- confirm
+    def confirm(self, hold: bool = False) -> Batch:
+        with self.guard:
+            self._ensure_idle()
+            batch = self._require_batch()
+            if batch.state != "planned":
+                raise BatchError(f"当前批次状态为 {batch.state}，不能确认")
+            if not batch.plan.ok:
+                raise BatchError("当前方案无解，不能确认；请调整规格后重新规划")
+
+            conflict = self._confirmation_conflict(batch)
+            if conflict:
+                # Nothing has been touched yet.  Drop back to planning with a
+                # freshly computed plan against the live card.
+                batch.log("conflict", conflict)
+                refreshed = compute_plan(
+                    slices=list(self.sim.slices.values()),
+                    specs=self.sim.specs,
+                    slot_count=self.sim.slot_count,
+                    requests=batch.requests,
+                    slice_ids=batch.slice_ids,
+                )
+                batch.plan = refreshed
+                batch.baseline_signature = self.sim.signature()
+                batch.state = "planned"
+                batch.error = conflict
+                batch.log(
+                    "replanned",
+                    refreshed.error
+                    or f"已按当前布局重算：拟拆除 {refreshed.removed_count} 块空闲切片",
+                )
+                return batch
+
+            batch.error = None
+            # Pause every slice this batch intends to remove, for the whole
+            # adjustment window.  Other idle slices keep accepting.
+            for removal in batch.plan.removals:
+                slc = self.sim.get(removal.slice_id)
+                if slc is not None:
+                    self.sim.set_paused(slc.id, True)
+            batch.state = "applying"
+            batch.log(
+                "confirmed",
+                "确认执行：待拆切片 "
+                + ("、".join(r.slice_id for r in batch.plan.removals) or "无")
+                + " 已暂停接单",
+            )
+            if hold:
+                batch.log("paused", "已进入调整窗口（暂不调用驱动），可测试接单行为")
+                return batch
+            self._begin_drive(batch)
         return self._apply(batch)
 
     def apply_held(self) -> Batch:
-        batch = self._require_batch()
-        if batch.state != "applying":
-            raise BatchError(f"当前批次状态为 {batch.state}，没有待执行的调整")
-        batch.log("applying", "调整窗口结束，开始调用驱动")
+        with self.guard:
+            self._ensure_idle()
+            batch = self._require_batch()
+            if batch.state != "applying":
+                raise BatchError(f"当前批次状态为 {batch.state}，没有待执行的调整")
+            batch.log("applying", "调整窗口结束，开始调用驱动")
+            self._begin_drive(batch)
         return self._apply(batch)
 
+    def _begin_drive(self, batch: Batch) -> None:
+        """Close the mutation gate before the lock is released to the driver."""
+        self._busy = True
+        batch.progress = {
+            **_empty_progress(),
+            "running": True,
+            "step_delay_ms": self.sim.step_delay_ms,
+            "started_at": utc_now(),
+        }
 
     def _confirmation_conflict(self, batch: Batch) -> str | None:
         if self.sim.signature() != batch.baseline_signature:
@@ -305,61 +368,123 @@ class BatchService:
         return ops
 
     def _apply(self, batch: Batch) -> Batch:
-        # The card may have changed since the last check (an external caller
-        # could have ignored the pause flag).  Re-validate before the driver.
-        conflict = self._retry_conflict(batch)
-        if conflict:
-            batch.state = "failed"
-            batch.error = conflict
-            batch.log("conflict", conflict)
-            return batch
-        ops = self._remaining_ops(batch)
-        if not ops:
-            return self._verify_and_deliver(batch)
-        batch.log("applying", "驱动执行：" + "；".join(op.describe() for op in ops))
-        try:
-            applied = self.driver.apply(ops, batch_id=batch.id)
-        except DriverError as exc:
-            batch.state = "failed"
-            batch.error = exc.message
-            # Reconciliation: report what actually made it onto the card.
-            if exc.applied:
-                done = ops[: exc.applied]
-                batch.applied_ops.extend(op.describe() for op in done)
-                batch.log(
-                    "partial",
-                    "驱动在改动生效后报错；已生效："
-                    + "；".join(op.describe() for op in done),
-                )
-            batch.log(
-                "failed",
-                f"驱动报错：{exc.message}；已建切片 {batch.id} 留给本批，重试只补未完成的改动",
+        """Drive the remaining operations.
+
+        Callers must already hold the mutation gate (``_begin_drive``), so a
+        concurrent request is turned away for the whole run.
+        """
+        with self.guard:
+            # The card may have changed since the last check (an external
+            # caller could have ignored the pause flag).  Re-validate before
+            # the driver.
+            conflict = self._retry_conflict(batch)
+            if conflict:
+                batch.state = "failed"
+                batch.error = conflict
+                batch.log("conflict", conflict)
+                self._finish_progress(batch)
+                self._busy = False
+                return batch
+            ops = self._remaining_ops(batch)
+            if not ops:
+                self._finish_progress(batch)
+                self._busy = False
+                return self._verify_and_deliver(batch)
+
+            batch.progress.update(
+                total=len(ops), ops=[op.describe() for op in ops], done=0
             )
-            return batch
-        batch.applied_ops.extend(op.describe() for op in ops)
-        batch.log("applied", f"驱动执行完成，共 {applied} 项改动")
-        return self._verify_and_deliver(batch)
+            batch.log("applying", "驱动执行：" + "；".join(op.describe() for op in ops))
+
+        applied = 0
+        error: DriverError | None = None
+        try:
+            applied = self.driver.apply(
+                ops,
+                batch_id=batch.id,
+                on_step=lambda count, op: self._driver_step(batch, count, ops, op),
+                guard=lambda: self.guard,
+            )
+        except DriverError as exc:
+            error = exc
+        except Exception as exc:  # never leave the gate stuck on an unexpected error
+            error = DriverError(f"驱动异常：{type(exc).__name__}: {exc}", applied)
+
+        with self.guard:
+            try:
+                if error is not None:
+                    batch.state = "failed"
+                    batch.error = error.message
+                    batch.progress.update(
+                        running=False,
+                        done=error.applied,
+                        finished_at=utc_now(),
+                    )
+                    # Reconciliation: report what actually made it onto the card.
+                    if error.applied:
+                        done = ops[: error.applied]
+                        batch.applied_ops.extend(op.describe() for op in done)
+                        batch.log(
+                            "partial",
+                            "驱动在改动生效后报错；已生效："
+                            + "；".join(op.describe() for op in done),
+                        )
+                    batch.log(
+                        "failed",
+                        f"驱动报错：{error.message}；已建切片 {batch.id} 留给本批，"
+                        "重试只补未完成的改动",
+                    )
+                    return batch
+                batch.progress.update(
+                    running=False,
+                    done=applied,
+                    finished_at=utc_now(),
+                )
+                batch.applied_ops.extend(op.describe() for op in ops)
+                batch.log("applied", f"驱动执行完成，共 {applied} 项改动")
+                return self._verify_and_deliver(batch)
+            finally:
+                batch.progress["running"] = False
+                self._busy = False
+
+    def _finish_progress(self, batch: Batch) -> None:
+        batch.progress.update(running=False, finished_at=utc_now())
+
+    def _driver_step(
+        self, batch: Batch, count: int, ops: list[DriverOp], op: DriverOp
+    ) -> None:
+        """Record durable progress after each committed driver mutation."""
+        batch.progress.update(
+            done=count,
+            current=op.describe(),
+            running=count < len(ops),
+        )
 
     # ---------------------------------------------------------------- retry
     def retry(self) -> Batch:
-        batch = self._require_batch()
-        if batch.state != "failed":
-            raise BatchError(f"当前批次状态为 {batch.state}，只有失败的批次可以重试")
-        self._sanitize_after_failure(batch)
-        if batch.state != "failed":
-            return batch
+        with self.guard:
+            self._ensure_idle()
+            batch = self._require_batch()
+            if batch.state != "failed":
+                raise BatchError(f"当前批次状态为 {batch.state}，只有失败的批次可以重试")
+            self._sanitize_after_failure(batch)
+            if batch.state != "failed":
+                return batch
 
-        # The card may have changed while the batch was failed.  Re-check the
-        # reserved drafts and the planned targets before touching anything.
-        conflict = self._retry_conflict(batch)
-        if conflict:
-            batch.error = conflict
-            batch.log("conflict", conflict)
-            return batch
-        batch.state = "applying"
-        batch.error = None
-        batch.log("retrying", "重试：只补未完成的改动")
+            # The card may have changed while the batch was failed.  Re-check
+            # the reserved drafts and the planned targets before touching
+            # anything.
+            conflict = self._retry_conflict(batch)
+            if conflict:
+                batch.error = conflict
+                batch.log("conflict", conflict)
+                return batch
+            batch.state = "applying"
+            batch.error = None
+            batch.log("retrying", "重试：只补未完成的改动")
+            self._begin_drive(batch)
         return self._apply(batch)
+
 
     def _sanitize_after_failure(self, batch: Batch) -> None:
         """Drop drafts that no longer match the plan before a retry."""
@@ -472,24 +597,26 @@ class BatchService:
 
     # ------------------------------------------------------------- abandon
     def abandon(self, rollback_drafts: bool = True) -> Batch:
-        batch = self._require_batch()
-        if batch.state not in ("planned", "failed", "applying"):
-            raise BatchError(f"当前批次状态为 {batch.state}，无需放弃")
-        removed: list[str] = []
-        if rollback_drafts:
-            for placement in batch.plan.placements:
-                slc = self.sim.get(placement.slice_id)
-                if slc is not None and slc.draft and slc.batch_id == batch.id:
-                    self.sim.remove_slice(slc.id, allow_running=True)
-                    removed.append(slc.id)
-        self._release_pauses(batch)
-        batch.state = "abandoned"
-        batch.log(
-            "abandoned",
-            "批次已放弃"
-            + (f"，回收本批已建切片：{'、'.join(removed)}" if removed else ""),
-        )
-        return batch
+        with self.guard:
+            self._ensure_idle()
+            batch = self._require_batch()
+            if batch.state not in ("planned", "failed", "applying"):
+                raise BatchError(f"当前批次状态为 {batch.state}，无需放弃")
+            removed: list[str] = []
+            if rollback_drafts:
+                for placement in batch.plan.placements:
+                    slc = self.sim.get(placement.slice_id)
+                    if slc is not None and slc.draft and slc.batch_id == batch.id:
+                        self.sim.remove_slice(slc.id, allow_running=True)
+                        removed.append(slc.id)
+            self._release_pauses(batch)
+            batch.state = "abandoned"
+            batch.log(
+                "abandoned",
+                "批次已放弃"
+                + (f"，回收本批已建切片：{'、'.join(removed)}" if removed else ""),
+            )
+            return batch
 
     # ---------------------------------------------------------------- misc
     def _release_pauses(self, batch: Batch | None) -> None:
@@ -506,8 +633,10 @@ class BatchService:
         return self.batch
 
     def clear(self) -> None:
-        if self.batch is not None and self.batch.state in ("applying", "failed"):
-            raise BatchError("当前批次尚未结束，不能清空")
-        if self.batch is not None:
-            self._release_pauses(self.batch)
-        self.batch = None
+        with self.guard:
+            self._ensure_idle()
+            if self.batch is not None and self.batch.state in ("applying", "failed"):
+                raise BatchError("当前批次尚未结束，不能清空")
+            if self.batch is not None:
+                self._release_pauses(self.batch)
+            self.batch = None

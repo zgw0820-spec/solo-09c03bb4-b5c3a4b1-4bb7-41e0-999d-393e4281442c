@@ -3,6 +3,7 @@
 const state = {
   data: null,
   plan: null, // last plan payload returned by /api/plan
+  pollTimer: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -108,6 +109,8 @@ function renderSlots() {
 function renderTable() {
   const tbody = $("#slice-table tbody");
   tbody.innerHTML = "";
+  const keepOrder = $("#order-slice").value;
+  const keepExt = $("#ext-remove-slice").value;
   const batch = state.data.batch;
   const planRemove = new Set(batch && batch.state !== "abandoned" ? batch.plan.removals.map(r => r.slice_id) : []);
   for (const slice of state.data.layout.slices) {
@@ -157,15 +160,105 @@ function renderTable() {
     add("#order-slice");
     if (slice.status === "idle" || slice.status === "busy") add("#ext-remove-slice");
   }
+  // Background polling re-renders the table; keep the operator's choices.
+  if (keepOrder && Array.from($("#order-slice").options).some((o) => o.value === keepOrder)) {
+    $("#order-slice").value = keepOrder;
+  }
+  if (keepExt && Array.from($("#ext-remove-slice").options).some((o) => o.value === keepExt)) {
+    $("#ext-remove-slice").value = keepExt;
+  }
 }
 
 function renderFault() {
   const banner = $("#fault-banner");
   const fault = state.data.layout.fault;
-  if (!fault) { banner.hidden = true; return; }
-  banner.hidden = false;
-  banner.textContent =
-    `已注入驱动故障：${fault.mode}，跳过 ${fault.skip} 项，剩余 ${fault.remaining}/${fault.count} 次 · ${fault.message}`;
+  if (!fault) { banner.hidden = true; } else {
+    banner.hidden = false;
+    banner.textContent =
+      `已注入驱动故障：${fault.mode}，跳过 ${fault.skip} 项，剩余 ${fault.remaining}/${fault.count} 次 · ${fault.message}`;
+  }
+  const delay = (state.data.layout.driver || {}).step_delay_ms || 0;
+  const cur = $("#driver-delay-current");
+  if (cur) cur.textContent = `当前单步延迟：${delay} ms`;
+  const input = $("#driver-delay");
+  if (input && document.activeElement !== input) input.value = String(delay);
+}
+
+/* Live follow: a background read-only poll keeps whichever page is open in
+   sync with the actual card.  Reads are never blocked by a slow driver, so a
+   second page sees each committed removal/creation and the steps still
+   pending while the first page's request is still in flight. */
+function schedulePoll() {
+  const busy = Boolean(state.data && state.data.busy);
+  const interval = busy ? 500 : 1500;
+  if (!state.pollTimer) {
+    state.pollTimer = setInterval(refreshState, interval);
+    state.pollDelay = interval;
+  } else if (state.pollDelay !== interval) {
+    clearInterval(state.pollTimer);
+    state.pollDelay = interval;
+    state.pollTimer = setInterval(refreshState, interval);
+  }
+  const banner = $("#busy-banner");
+  const batch = state.data && state.data.batch;
+  if (busy) {
+    banner.hidden = false;
+    const p = (batch && batch.driver) || {};
+    $("#busy-text").textContent =
+      `驱动正在执行（${p.done || 0}/${p.total || 0} 项，单步 ${p.step_delay_ms || 0} ms）：` +
+      `本页与其它页面都会自动刷新实际布局；此期间的重复执行、放弃、外部拆建、导入或重置会被拒绝。`;
+  } else {
+    banner.hidden = true;
+  }
+  setBusyUi(busy);
+}
+
+const BUSY_SELECTORS = [
+  "#plan-btn", "#reset-btn", "#import-btn", "#order-btn",
+  "#ext-add-btn", "#ext-remove-btn", "#fault-btn", "#fault-clear-btn",
+  "#driver-delay-btn",
+];
+
+function setBusyUi(busy) {
+  for (const sel of BUSY_SELECTORS) {
+    const el = $(sel);
+    if (!el) continue;
+    if (busy) {
+      if (!el.dataset.busyDisabled) {
+        el.dataset.busyDisabled = el.disabled ? "was-disabled" : "1";
+        el.disabled = true;
+        el.title = "驱动正在执行，请等待本次调整完成后再操作";
+      }
+    } else if (el.dataset.busyDisabled) {
+      el.disabled = el.dataset.busyDisabled === "was-disabled";
+      el.title = "";
+      delete el.dataset.busyDisabled;
+    }
+  }
+  const actions = $("#batch-actions");
+  if (actions) {
+    actions.querySelectorAll("button").forEach((btn) => {
+      if (busy) {
+        btn.dataset.busyDisabled = btn.disabled ? "was-disabled" : "1";
+        btn.disabled = true;
+        btn.title = "驱动正在执行，请等待本次调整完成后再操作";
+      } else if (btn.dataset.busyDisabled) {
+        btn.disabled = btn.dataset.busyDisabled === "was-disabled";
+        btn.title = "";
+        delete btn.dataset.busyDisabled;
+      }
+    });
+  }
+}
+
+async function refreshState() {
+  if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+  try {
+    const data = await api("/api/state");
+    state.data = data;
+    if (!state.plan && data.batch) state.plan = data.batch.plan;
+    renderAll();
+  } catch (_) { /* transient; next tick retries */ }
 }
 
 function pillFor(batch) {
@@ -237,12 +330,32 @@ function renderBatch() {
 
   const plan = batch.plan;
   const actual = batch.actual;
+  const driver = batch.driver || {};
+  const busy = Boolean(state.data.busy);
   const rows = [];
   rows.push(["批次", `${batch.id} · ${batch.state}`]);
   rows.push(["新切片", batch.slice_ids.join("、")]);
   if (plan.ok) {
     rows.push(["计划位置", plan.placements.map((p) => `${p.slice_id}→${fmtInterval(p.interval)}`).join("；")]);
     rows.push(["拟拆除", plan.removals.length ? plan.removals.map((r) => r.slice_id).join("、") : "无"]);
+  }
+  if (driver.running || (driver.total > 0 && driver.started_at)) {
+    const stateLabel = busy && batch.state === "applying"
+      ? (driver.done >= driver.total ? "核对中" : "执行中")
+      : (batch.state === "failed" ? "已中断" : "已结束");
+    rows.push([
+      "驱动进度",
+      `${stateLabel}：已完成 ${driver.done || 0}/${driver.total || 0} 项` +
+      `${driver.step_delay_ms ? ` · 单步延迟 ${driver.step_delay_ms} ms` : ""}` +
+      `${driver.current ? ` · 最近完成：${driver.current}` : ""}`,
+    ]);
+    if (busy && Array.isArray(driver.ops) && driver.ops.length) {
+      const pending = driver.ops.slice(driver.done || 0);
+      rows.push(["待完成步骤", pending.length ? pending.join("；") : "无（正在核对并交付）"]);
+    } else if (batch.state === "failed" && Array.isArray(driver.ops) && driver.ops.length) {
+      const pending = driver.ops.slice(driver.done || 0);
+      if (pending.length) rows.push(["未完成步骤", pending.join("；")]);
+    }
   }
   if (batch.error) rows.push(["最近问题", batch.error]);
   if (actual) {
@@ -298,6 +411,9 @@ function renderBatch() {
       <span class="t">${esc(e.at.slice(11, 19))}</span>
       <span><span class="k">${esc(e.kind)}</span>${esc(e.message)}</span>
     </div>`).join("");
+  // Buttons are re-created above, so re-apply the busy gate every render
+  // (including the background poll while a long driver request is in flight).
+  setBusyUi(Boolean(state.data.busy));
 }
 
 function fillSpecSelects() {
@@ -357,9 +473,18 @@ function renderAll() {
   renderPlanResult();
   renderBatch();
   fillSpecSelects();
+  schedulePoll();
 }
 
 async function act(path, body) {
+  // A slow driver keeps /api/batch/confirm (etc.) open for a while.  Poll the
+  // read-only state endpoint meanwhile so this page also shows each committed
+  // step and what is still pending, not just the final answer.
+  const longRun = path.startsWith("/api/batch");
+  let liveTimer = null;
+  if (longRun) {
+    liveTimer = setInterval(() => { pollLive(); }, 500);
+  }
   try {
     state.data = await api(path, { method: "POST", body });
     if (path.startsWith("/api/plan")) {
@@ -383,8 +508,29 @@ async function act(path, body) {
     }
   } catch (err) {
     toast(err.message);
+  } finally {
+    if (liveTimer) {
+      clearInterval(liveTimer);
+      const data = await api("/api/state").catch(() => null);
+      if (data) { state.data = data; renderAll(); }
+    }
   }
 }
+
+async function pollLive() {
+  try {
+    const data = await api("/api/state");
+    state.data = data;
+    schedulePoll();
+    // Render only the layout/table/batch, never clobber the spec form fields
+    // while the long request is still in flight.
+    renderSlots();
+    renderTable();
+    renderFault();
+    renderBatch();
+  } catch (_) { /* transient; next tick retries */ }
+}
+
 
 /* -------------------------------------------------------------- wiring */
 $("#plan-btn").addEventListener("click", () => {
@@ -497,6 +643,18 @@ $("#fault-clear-btn").addEventListener("click", async () => {
   state.data = await api("/api/fault/clear", { method: "POST" });
   renderAll();
   toast("故障已清除。", "ok");
+});
+
+$("#driver-delay-btn").addEventListener("click", async () => {
+  try {
+    state.data = await api("/api/driver/delay", {
+      method: "POST",
+      body: { step_delay_ms: Number($("#driver-delay").value) },
+    });
+    renderAll();
+    const ms = state.data.layout.driver.step_delay_ms;
+    toast(ms > 0 ? `单步延迟已设为 ${ms} ms，可用于演练慢卡。` : "单步延迟已关闭。", "ok");
+  } catch (err) { toast(err.message); }
 });
 
 $("#selftest-btn").addEventListener("click", async () => {

@@ -19,6 +19,10 @@
 </header>
 
 <div id="toast" class="toast" hidden></div>
+<div id="busy-banner" class="busy-banner" hidden>
+  <span class="spinner" aria-hidden="true"></span>
+  <span id="busy-text">驱动正在执行，本页自动刷新实际布局；重复执行、放弃、外部拆建、导入或重置会被拒绝。</span>
+</div>
 
 <main>
   <section class="card" id="layout-card">
@@ -111,6 +115,14 @@
         <h3>外部移除空闲切片</h3>
         <label>切片 <select id="ext-remove-slice"></select></label>
         <button id="ext-remove-btn">移除</button>
+      </div>
+      <div class="sim-block">
+        <h3>慢驱动演练</h3>
+        <p class="hint">每项驱动操作延迟 N 毫秒，用来演练慢卡：可在另一个页面刷新，
+          观察拆建逐步生效、哪些步骤还没完成。0 表示不延迟。</p>
+        <label>单步延迟（毫秒） <input id="driver-delay" type="number" min="0" max="10000" step="100" value="0"></label>
+        <p class="hint" id="driver-delay-current">当前单步延迟：0 ms</p>
+        <button id="driver-delay-btn">设置延迟</button>
       </div>
       <div class="sim-block">
         <h3>驱动故障注入</h3>

@@ -147,6 +147,12 @@ class FaultRequest(BaseModel):
     message: str = "模拟驱动错误：设备忙，请重试"
 
 
+class DriverDelayRequest(BaseModel):
+    """Per-operation delay for the simulated driver (milliseconds)."""
+
+    step_delay_ms: int = Field(default=0, ge=0, le=10000)
+
+
 class ExternalIdleSliceRequest(BaseModel):
     spec: str
     interval: SlotInterval
